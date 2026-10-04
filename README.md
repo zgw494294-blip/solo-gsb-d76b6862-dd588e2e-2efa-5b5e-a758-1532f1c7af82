@@ -11,7 +11,8 @@
 - 后端：Python + FastAPI（求解核心见 `app/solver.py`，纯标准库 BFS；
   配方 / 炉次 / 归档 / 作废用 SQLite 持久化，见 `app/db.py`、`app/store.py`；
   已归档炉次只读电费试算见 `app/electricity.py`，原曲线复用只读核验见
-  `app/reuse.py`，归档快照离线 HTML 工艺单导出见 `app/exports.py`）
+  `app/reuse.py`，归档快照离线 HTML 工艺单导出见 `app/exports.py`；
+  单台炉已归档炉次开炉计划见 `GET/PUT /api/furnace-plan`）
 - 前端：原生 HTML / CSS / JavaScript（`static/`，无任何前端构建与框架，
   页面分为「编排求解 / 材料配方 / 炉次草稿」三个标签页；已归档炉次详情中
   含原曲线复用检查、电费试算卡片与单份 HTML 工艺单下载）
@@ -331,6 +332,8 @@ SQLite（默认 `/data/planner.db`），Compose 以命名卷 `planner-data` 挂�
 | POST | `/api/drafts/{id}/reuse-check` | 已归档炉次原曲线复用检查（只读当前配方，不重新求解；未知 404 / 未归档 422） |
 | POST | `/api/drafts/{id}/electricity` | 已归档炉次电费试算（只读冻结曲线，不保存；未知 404 / 未归档或参数非法 422） |
 | GET | `/api/drafts/{id}/sheet` | 下载已归档炉次的单份离线 HTML 工艺单（UTF-8 HTML 附件；未知 404 / 未归档 422；只读归档快照，不写库） |
+| GET | `/api/furnace-plan` | 读取单台炉开炉计划（version + 排段，按开始分钟、ID 排序；空计划版本 1） |
+| PUT | `/api/furnace-plan` | 批量提交 1～20 项改动（非负整数 Unix 开始分钟，null 移除，未提及保留；同批可交换；版本过期/重叠 409、未知炉次 404、未归档/非法输入 422；成功整批写入、版本 +1） |
 
 ### 从零编排（可直接复制执行）
 
@@ -958,19 +961,177 @@ content-disposition: attachment; filename="draft-1-v1-sheet.html";
 - **失败显示后端中文原因（如未归档 422）或网络异常提示，按钮立即可重试**；
   导出为只读操作，失败与重试都不改变任何数据。
 
+## 单台炉开炉计划（仅安排已归档炉次）
+
+为**单台炉**维护一份**已归档炉次**的开炉计划：每炉次最多安排一段开炉
+区间，区间时长不手填——始终取该炉次**归档冻结曲线的档数 × 5 分钟**，
+不读当前配方、不重新求解；归档、草稿与配方都不受计划读写影响。计划存入
+现有 SQLite 卷（`planner-data`），重启保留；旧库启动时自动初始化为
+**空计划（版本 1）**。
+
+接口（均返回 JSON）：
+
+| 方法 | 路径 | 说明 |
+| --- | --- | --- |
+| GET | `/api/furnace-plan` | 读取整台炉计划：`version` 与排段（炉次 ID、开始/结束分钟；按开始分钟、ID 排序）；空计划版本为 1 |
+| PUT | `/api/furnace-plan` | 批量提交查看后的 1～20 项改动；成功整批写入、版本 +1 并返回完整计划 |
+
+`PUT` 请求体：
+
+- `version`（必填，≥1 整数）：批量查看时读到的计划版本；
+- `changes`（必填，1～20 项数组，同批炉次 ID 不得重复），每项：
+  - `draftId`：炉次 ID（严格整数）；
+  - `startMinute`：**非负整数 Unix 开始分钟**（如 29851680 =
+    2026-10-04 08:00 UTC），表示设置 / 覆盖该炉次的开始时间；`null`
+    表示**移除**该炉次（原本不在计划中时为空操作，版本仍 +1）。
+  - **未在 `changes` 中提及的炉次全部保留**，因此一批可以只改一两段。
+
+结束分钟返回为 `endMinute = startMinute + 档数 × 5`；按改动后的**全部**
+排段 `[startMinute, endMinute)` 判冲突，**首尾相接允许**（前一段的结束
+正好等于后一段的开始不冲突），严格重叠才拒绝。允许**同批交换**两段的
+开始时间——按改动后的完整集合判冲突，不会把交换误判为重叠。
+
+状态码（任何失败都**不改变计划、不增加版本**）：
+
+- **409**：版本过期（响应体附 `currentVersion`，重新 GET 后再提交），
+  或改动后存在排段重叠（中文说明冲突的两段炉次与区间）；
+- **404**：改动中的炉次 ID 未知；
+- **422**：炉次存在但**未归档**（活动 / 无解 / 已作废草稿，`null`
+  移除同样要求已归档），或请求体非法（版本 <1、改动非 1～20 项、ID
+  重复、开始分钟为负数 / 小数 / 布尔 / 字符串等）。
+
+并发与隔离：整批改动在**单条事务**里提交，同版本并发 PUT 只有**一批**
+成功，其余收到 **409**；任何 GET 都不会读到提交到一半的批次，看到的
+永远是某一整次提交的完整计划。
+
+### 读取计划（可直接复制执行）
+
+```bash
+curl -sS http://localhost:8000/api/furnace-plan
+```
+
+从未提交过时返回空计划（版本 1）：
+
+```json
+{"version": 1, "items": []}
+```
+
+有排段时按**开始分钟、再按炉次 ID** 排序，例如（炉次 1 冻结曲线 6 档 =
+30 分钟、炉次 2 为 4 档 = 20 分钟）：
+
+```json
+{
+  "version": 2,
+  "items": [
+    {"draftId": 1, "startMinute": 29851680, "endMinute": 29851710},
+    {"draftId": 2, "startMinute": 29851710, "endMinute": 29851730}
+  ]
+}
+```
+
+### 创建 / 覆盖 / 移除（可直接复制执行）
+
+接着上面的归档例子（炉次 1、2 已归档），基于查看版本 1 一次安排两段、
+首尾相接：
+
+```bash
+curl -sS -X PUT http://localhost:8000/api/furnace-plan \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "version": 1,
+    "changes": [
+      {"draftId": 1, "startMinute": 29851680},
+      {"draftId": 2, "startMinute": 29851710}
+    ]
+  }'
+```
+
+成功返回 **200** 与完整计划（版本 +1 变为 2）。之后只改炉次 2、炉次 1
+未提及则保留；用 `null` 移除炉次 2：
+
+```bash
+# 覆盖：只提交要改的炉次，其余保留
+curl -sS -X PUT http://localhost:8000/api/furnace-plan \
+  -H 'Content-Type: application/json' \
+  -d '{"version": 2, "changes": [{"draftId": 2, "startMinute": 29851860}]}'
+
+# 移除：startMinute 传 null（不在计划中也是空操作）
+curl -sS -X PUT http://localhost:8000/api/furnace-plan \
+  -H 'Content-Type: application/json' \
+  -d '{"version": 3, "changes": [{"draftId": 2, "startMinute": null}]}'
+```
+
+### 同批交换开始时间
+
+两段互换开始时间时放在**同一批**里：服务按改动后的完整集合判冲突，交换
+本身合法（下例两段各 30 分钟，08:00 与 09:00 互换）：
+
+```bash
+# 假设当前：炉次 1 在 29851680（08:00）、炉次 2 在 29851740（09:00）
+curl -sS -X PUT http://localhost:8000/api/furnace-plan \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "version": 4,
+    "changes": [
+      {"draftId": 1, "startMinute": 29851740},
+      {"draftId": 2, "startMinute": 29851680}
+    ]
+  }'
+```
+
+> 注意分两次提交通常会先撞上重叠（把炉次 1 移到 09:00 时炉次 2 还在
+> 09:00）；交换请用同一批完成。
+
+### 版本过期与时间重叠 —— HTTP 409
+
+```bash
+# 别人已先成功提交（当前版本已到 3），仍带 version=2 提交
+curl -sS -i -X PUT http://localhost:8000/api/furnace-plan \
+  -H 'Content-Type: application/json' \
+  -d '{"version": 2, "changes": [{"draftId": 3, "startMinute": 29851680}]}'
+# HTTP/1.1 409 Conflict
+# {"detail":{"detail":"开炉计划已过期：你查看的是版本 2，当前为版本 3，请重新读取后再提交。",
+#            "currentVersion":3}}
+
+# 排段重叠：炉次 1 已占 [29851680, 29851710)，炉次 3 若 30 分钟长且
+# 从 29851690 开始，区间严格相交（相接不报错）
+curl -sS -i -X PUT http://localhost:8000/api/furnace-plan \
+  -H 'Content-Type: application/json' \
+  -d '{"version": 3, "changes": [{"draftId": 3, "startMinute": 29851690}]}'
+# HTTP/1.1 409 Conflict
+# {"detail":"炉次 1（29851680～29851710）与炉次 3（29851690～29851720）的开炉时间重叠，请调整后重新提交。"}
+```
+
+未知炉次 → **404**；未归档炉次（含 `null` 移除）或非法入参（改动 0 项 /
+超过 20 项、同批 ID 重复、负数 / 小数 / 布尔开始分钟等）→ **422**：
+
+```bash
+curl -sS -i -X PUT http://localhost:8000/api/furnace-plan \
+  -H 'Content-Type: application/json' \
+  -d '{"version": 3, "changes": [{"draftId": 999, "startMinute": 0}]}'
+# HTTP/1.1 404 Not Found
+# {"detail":"炉次草稿 999 不存在。"}
+
+curl -sS -i -X PUT http://localhost:8000/api/furnace-plan \
+  -H 'Content-Type: application/json' \
+  -d '{"version": 3, "changes": [{"draftId": 4, "startMinute": 0}]}'
+# HTTP/1.1 422 Unprocessable Entity（炉次 4 还是活动草稿）
+# {"detail":"炉次 4 尚未归档，开炉计划只能安排已归档炉次。"}
+```
+
 ## 目录结构
 
 ```
 .
 ├── app/
 │   ├── __init__.py
-│   ├── main.py        # FastAPI 路由与参数校验（schedule / recipes / drafts / archive / cancel / 复用检查 / 电费试算 / 工艺单下载）
+│   ├── main.py        # FastAPI 路由与参数校验（schedule / recipes / drafts / archive / cancel / 复用检查 / 电费试算 / 工艺单下载 / 单台炉开炉计划）
 │   ├── solver.py      # 规则常量、校验与 BFS 求解（配方与草稿复用）
 │   ├── reuse.py       # 已归档炉次原曲线复用检查（只读核验，不重新求解）
 │   ├── electricity.py # 已归档炉次电费试算（跨小时/午夜分摊、逐档与总费用舍入）
 │   ├── exports.py     # 已归档炉次单份离线 HTML 工艺单渲染（纯归档快照，样式内嵌）
 │   ├── db.py          # SQLite 连接、建表、全局读锁与写操作互斥锁
-│   └── store.py       # 配方 / 炉次草稿 / 归档 / 作废 / 归档曲线只读 / 复用检查 / 工艺单快照 的事务化读写
+│   └── store.py       # 配方 / 炉次草稿 / 归档 / 作废 / 归档曲线只读 / 复用检查 / 工艺单快照 / 单台炉开炉计划 的事务化读写
 ├── static/
 │   ├── index.html     # 页面（编排求解 / 材料配方 / 炉次草稿 三个标签页）
 │   ├── styles.css     # 样式

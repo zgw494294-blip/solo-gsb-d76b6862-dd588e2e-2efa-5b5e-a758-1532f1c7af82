@@ -108,6 +108,24 @@ CREATE TABLE IF NOT EXISTS recipe_versions (
     PRIMARY KEY (recipe_id, version),
     FOREIGN KEY (recipe_id) REFERENCES recipes(id)
 );
+
+-- 单台炉的开炉计划（仅安排已归档炉次，与配方 / 草稿 / 归档互不影响）：
+-- meta 为单行表，保存计划版本——空计划版本视为 1，每批成功提交 +1；
+-- entries 每炉次至多一段（draft_id 唯一），开始时间为非负整数 Unix 分钟，
+-- 时长不入库（始终取归档冻结曲线档数 × 5 分钟）。随现有 SQLite 卷持久化，
+-- 旧库启动时由 CREATE TABLE IF NOT EXISTS 自动初始化为空计划（版本 1）。
+CREATE TABLE IF NOT EXISTS furnace_plan_meta (
+    id          INTEGER PRIMARY KEY CHECK (id = 1),
+    version     INTEGER NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS furnace_plan_entries (
+    draft_id      INTEGER PRIMARY KEY,
+    start_minute  INTEGER NOT NULL,
+    created_at    TEXT    NOT NULL,
+    updated_at    TEXT    NOT NULL,
+    FOREIGN KEY (draft_id) REFERENCES drafts(id)
+);
 """
 
 

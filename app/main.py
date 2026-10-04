@@ -6,7 +6,7 @@ import json
 import math
 from contextlib import asynccontextmanager
 from pathlib import Path
-from typing import Any
+from typing import Annotated, Any
 from urllib.parse import quote
 
 from fastapi import FastAPI, HTTPException, Request
@@ -30,7 +30,7 @@ async def lifespan(app: FastAPI):
     yield
 
 
-app = FastAPI(title="共炉保温编排台", version="2.5.0", lifespan=lifespan)
+app = FastAPI(title="共炉保温编排台", version="2.6.0", lifespan=lifespan)
 
 
 @app.exception_handler(RequestValidationError)
@@ -40,6 +40,7 @@ def _validation_handler(request: Request, exc: RequestValidationError):
         "list_type": "必须是数组。",
         "int_type": "必须是整数。",
         "int_parsing": "必须是整数。",
+        "int_from_float": "必须是整数。",
         "float_parsing": "必须是数值。",
         "missing": "缺少必填字段。",
         "too_short": "数量少于最小值。",
@@ -535,6 +536,61 @@ def draft_sheet(draft_id: int):
             )
         },
     )
+
+
+# ---------------- 单台炉开炉计划（仅安排已归档炉次） ----------------
+
+
+# 严格非负整数 Unix 分钟：拒绝 true/false 与 12.0 这类小数（pydantic v2
+# 以 Field(strict=True) 收紧）
+NonNegativeMinute = Annotated[int, Field(strict=True, ge=0)]
+# 严格整数 ID（存在与否由 store 判 404；只拒绝布尔/小数/字符串）
+StrictInteger = Annotated[int, Field(strict=True)]
+
+
+class PlanChangeIn(BaseModel):
+    # 炉次 ID（严格整数；ID 本身存在与否由 store 判 404）
+    draft_id: StrictInteger = Field(alias="draftId")
+    # 非负整数 Unix 开始分钟表示设置/覆盖；null 表示移除
+    start_minute: NonNegativeMinute | None = Field(alias="startMinute")
+
+    model_config = {"populate_by_name": True}
+
+
+class PlanSubmitIn(BaseModel):
+    # 批量查看时看到的计划版本：已变化则 409；空计划版本为 1
+    version: StrictInteger = Field(ge=1)
+    # 1～20 项改动，每项一个炉次；同批炉次 ID 不得重复
+    changes: list[PlanChangeIn] = Field(min_length=1, max_length=20)
+
+    @field_validator("changes")
+    @classmethod
+    def _unique_draft(cls, v: list[PlanChangeIn]) -> list[PlanChangeIn]:
+        ids = [item.draft_id for item in v]
+        if len(set(ids)) != len(ids):
+            raise ValueError("同一批改动中的炉次 ID 不得重复。")
+        return v
+
+
+@app.get("/api/furnace-plan")
+def get_furnace_plan():
+    # 返回计划 version 与全部排段（炉次 ID、开始/结束分钟，按开始分钟、
+    # ID 排序）；从未提交过的空计划版本为 1
+    return store.get_furnace_plan()
+
+
+@app.put("/api/furnace-plan")
+def submit_furnace_plan(payload: PlanSubmitIn):
+    # 整批查看后提交：未提及项保留；未知炉次 404，未归档 422，版本过期或
+    # 排段重叠 409；任何失败都不改变计划。成功整批写入、version +1 并返回
+    # 完整计划。时长取归档冻结曲线档数 × 5 分钟，不读当前配方或重新求解。
+    try:
+        return store.submit_furnace_plan(
+            payload.version,
+            [(item.draft_id, item.start_minute) for item in payload.changes],
+        )
+    except store.StoreError as exc:
+        _raise_store_error(exc)
 
 
 @app.get("/healthz")

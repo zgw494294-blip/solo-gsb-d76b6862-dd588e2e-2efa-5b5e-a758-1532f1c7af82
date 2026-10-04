@@ -1036,3 +1036,179 @@ def check_archived_reuse(draft_id: int) -> dict:
             "items": items,
             "reusable": reusable,
         }
+
+
+# ---------------- 单台炉开炉计划（仅安排已归档炉次） ----------------
+
+
+def _plan_items(conn) -> list[dict]:
+    """在已持锁的连接上读取计划全部排段。
+
+    每段的结束分钟 = 开始分钟 + 归档冻结曲线档数 × 5；时长不入库，因此
+    归档曲线是唯一数据来源，不读当前配方、不重新求解。按开始分钟、再按
+    炉次 ID 升序返回。
+    """
+    rows = conn.execute(
+        """SELECT p.draft_id AS draft_id, p.start_minute AS start_minute,
+                  a.result_json AS result_json
+           FROM furnace_plan_entries p
+           JOIN archives a ON a.draft_id = p.draft_id"""
+    ).fetchall()
+    items: list[dict] = []
+    for r in rows:
+        steps = len(json.loads(r["result_json"])["temperatures"])
+        start = r["start_minute"]
+        items.append(
+            {
+                "draftId": r["draft_id"],
+                "startMinute": start,
+                "endMinute": start + steps * 5,
+            }
+        )
+    items.sort(key=lambda it: (it["startMinute"], it["draftId"]))
+    return items
+
+
+def _plan_version(conn) -> int:
+    row = conn.execute(
+        "SELECT version FROM furnace_plan_meta WHERE id=1"
+    ).fetchone()
+    # 无 meta 行即尚未提交过的空计划：版本为 1
+    return int(row["version"]) if row is not None else 1
+
+
+def get_furnace_plan() -> dict:
+    """读取整台炉的开炉计划：版本 + 全部排段（按开始分钟、炉次 ID 排序）。
+
+    空计划返回版本 1 与空数组。只读，持全局读锁，永远不会读到提交到一半
+    的批次。
+    """
+    with lock(), connect() as conn:
+        return {"version": _plan_version(conn), "items": _plan_items(conn)}
+
+
+def submit_furnace_plan(
+    expected_version: int, changes: list[tuple[int, int | None]]
+) -> dict:
+    """整批查看后提交开炉计划改动（upsert/移除，未提及项保留）。
+
+    - 每项 (draft_id, start)：start 为非负整数 Unix 分钟表示设置 / 覆盖，
+      None 表示移除该炉次（原本没有该炉次时为空操作）；同一批炉次 ID 不
+      重复已由路由层以 422 拦截；
+    - 未知炉次 => 404；炉次存在但未归档 => 422（移除同样要求已归档）；
+      每炉次时长取归档冻结曲线档数 × 5 分钟，不读当前配方、不重新求解；
+    - 携带的查看版本与当前不一致 => 409（附当前版本）；
+    - 按改动后的全部排段 [start, end) 判冲突：区间严格重叠才冲突，首尾
+      相接（一端 = 另一端开始）允许；冲突 => 409；
+    - 成功才整批写入（未提及项保留）、版本 +1；任何失败都在 COMMIT 之前
+      抛错回滚，不改变计划与版本。同版本并发提交由 BEGIN IMMEDIATE 与
+      版本复核串行化：只有一批成功，其余收到 409；读取只持读锁，永远
+      看不到半批。
+    """
+    now = _now()
+    with write_lock(), lock(), connect() as conn:
+        with _tx(conn):
+            current_version = _plan_version(conn)
+            if current_version != expected_version:
+                raise Conflict(
+                    f"开炉计划已过期：你查看的是版本 {expected_version}，"
+                    f"当前为版本 {current_version}，请重新读取后再提交。",
+                    current_version,
+                )
+
+            # 引用炉次必须存在且已归档：未知 => 404，未归档 => 422。
+            # 按请求顺序给出第一个不合规炉次。
+            change_ids = [draft_id for draft_id, _ in changes]
+            placeholders = ",".join("?" * len(change_ids))
+            rows = conn.execute(
+                f"""SELECT d.id AS id, a.id AS archive_id,
+                           a.result_json AS result_json
+                    FROM drafts d
+                    LEFT JOIN archives a ON a.draft_id = d.id
+                    WHERE d.id IN ({placeholders})""",
+                change_ids,
+            ).fetchall()
+            by_id = {r["id"]: r for r in rows}
+            durations: dict[int, int] = {}
+            for draft_id in change_ids:
+                r = by_id.get(draft_id)
+                if r is None:
+                    raise NotFound(f"炉次草稿 {draft_id} 不存在。")
+                if r["archive_id"] is None:
+                    raise Unprocessable(
+                        f"炉次 {draft_id} 尚未归档，开炉计划只能安排已归档炉次。"
+                    )
+                durations[draft_id] = (
+                    len(json.loads(r["result_json"])["temperatures"]) * 5
+                )
+
+            # 改动前的全部排段（未提及项保留）
+            existing = conn.execute(
+                "SELECT draft_id, start_minute FROM furnace_plan_entries"
+            ).fetchall()
+            merged: dict[int, int] = {
+                r["draft_id"]: r["start_minute"] for r in existing
+            }
+            for draft_id, start in changes:
+                if start is None:
+                    merged.pop(draft_id, None)
+                else:
+                    merged[draft_id] = start
+
+            # 合并后全部炉次的时长：本批改动取前面已查到的档数，未提及而
+            # 保留的炉次从其归档冻结曲线取（均为归档炉次，JOIN 必有行）
+            missing_ids = sorted(set(merged) - set(durations))
+            if missing_ids:
+                ph = ",".join("?" * len(missing_ids))
+                for r in conn.execute(
+                    f"""SELECT draft_id, result_json FROM archives
+                        WHERE draft_id IN ({ph})""",
+                    missing_ids,
+                ).fetchall():
+                    durations[r["draft_id"]] = (
+                        len(json.loads(r["result_json"])["temperatures"]) * 5
+                    )
+
+            # 按改动后的全部 [start, end) 判冲突：首尾相接允许
+            intervals = sorted(
+                (
+                    (start, start + durations[draft_id], draft_id)
+                    for draft_id, start in merged.items()
+                ),
+                key=lambda x: (x[0], x[2]),
+            )
+            for (s1, e1, id1), (s2, e2, id2) in zip(intervals, intervals[1:]):
+                if s2 < e1:
+                    raise Conflict(
+                        f"炉次 {id1}（{s1}～{e1}）与炉次 {id2}"
+                        f"（{s2}～{e2}）的开炉时间重叠，请调整后重新提交。"
+                    )
+
+            # 整批 upsert / 移除；同一事务内与版本 +1 一起生效
+            for draft_id, start in changes:
+                if start is None:
+                    conn.execute(
+                        "DELETE FROM furnace_plan_entries WHERE draft_id=?",
+                        (draft_id,),
+                    )
+                else:
+                    conn.execute(
+                        """INSERT INTO furnace_plan_entries
+                               (draft_id, start_minute, created_at, updated_at)
+                           VALUES (?,?,?,?)
+                           ON CONFLICT(draft_id) DO UPDATE SET
+                               start_minute=excluded.start_minute,
+                               updated_at=excluded.updated_at""",
+                        (draft_id, start, now, now),
+                    )
+
+            new_version = current_version + 1
+            conn.execute(
+                """INSERT INTO furnace_plan_meta (id, version)
+                   VALUES (1, ?)
+                   ON CONFLICT(id) DO UPDATE SET version=excluded.version""",
+                (new_version,),
+            )
+
+        # 提交完成后从库内重读完整计划（复用同一连接，保证与写入严格一致）
+        return {"version": _plan_version(conn), "items": _plan_items(conn)}
