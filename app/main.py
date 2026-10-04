@@ -30,7 +30,7 @@ async def lifespan(app: FastAPI):
     yield
 
 
-app = FastAPI(title="共炉保温编排台", version="2.5.0", lifespan=lifespan)
+app = FastAPI(title="共炉保温编排台", version="2.6.0", lifespan=lifespan)
 
 
 @app.exception_handler(RequestValidationError)
@@ -535,6 +535,129 @@ def draft_sheet(draft_id: int):
             )
         },
     )
+
+
+# ---------------- 开炉计划（单台炉，仅已归档炉次） ----------------
+
+
+_STARTUP_PLAN_SCHEMA = {
+    "type": "object",
+    "required": ["version", "changes"],
+    "properties": {
+        "version": {
+            "title": "查看时的计划版本",
+            "description": "读取计划时拿到的 version；空计划为 1。提交时已变化则 409。",
+            "type": "integer",
+            "minimum": 1,
+        },
+        "changes": {
+            "title": "改动列表",
+            "description": "1～20 项改动；每项给出炉次 ID 与非负整数 Unix 开始分钟，null 表示移除",
+            "type": "array",
+            "minItems": 1,
+            "maxItems": 20,
+            "items": {
+                "type": "object",
+                "required": ["draftId", "startMinute"],
+                "properties": {
+                    "draftId": {"type": "integer", "minimum": 1},
+                    "startMinute": {"type": ["integer", "null"], "minimum": 0},
+                },
+            },
+        },
+    },
+}
+
+
+def _is_real_int(raw: Any) -> bool:
+    """只接受真正的整数；拒绝布尔与 12.0 这类小数。"""
+    return isinstance(raw, int) and not isinstance(raw, bool)
+
+
+def _validate_startup_plan_body(body: Any) -> tuple[int, list[tuple[int, int | None]]]:
+    """校验开炉计划提交体；非法时抛 422（中文 detail）。"""
+
+    def fail(text: str) -> None:
+        raise HTTPException(status_code=422, detail=text)
+
+    if not isinstance(body, dict):
+        fail("请求体必须是 JSON 对象。")
+
+    if "version" not in body:
+        fail("缺少必填字段 version（所查看的计划版本）。")
+    if not _is_real_int(body["version"]) or body["version"] < 1:
+        fail("version 必须是不小于 1 的整数。")
+
+    if "changes" not in body:
+        fail("缺少必填字段 changes（改动列表）。")
+    changes_raw = body["changes"]
+    if not isinstance(changes_raw, list):
+        fail("changes 必须是以数组形式给出的改动列表。")
+    if not 1 <= len(changes_raw) <= 20:
+        fail("每批改动必须为 1～20 项。")
+
+    changes: list[tuple[int, int | None]] = []
+    seen: set[int] = set()
+    for i, item in enumerate(changes_raw):
+        if not isinstance(item, dict):
+            fail(f"第 {i + 1} 项改动必须是 JSON 对象。")
+        if "draftId" not in item:
+            fail(f"第 {i + 1} 项改动缺少必填字段 draftId。")
+        draft_id = item["draftId"]
+        if not _is_real_int(draft_id) or draft_id < 1:
+            fail(f"第 {i + 1} 项改动的 draftId 必须是正整数。")
+        if draft_id in seen:
+            fail(f"炉次 ID {draft_id} 在本批改动中重复，每炉次每批只能出现一次。")
+        seen.add(draft_id)
+
+        if "startMinute" not in item:
+            fail(f"第 {i + 1} 项改动缺少必填字段 startMinute。")
+        start = item["startMinute"]
+        if start is not None and (not _is_real_int(start) or start < 0):
+            fail(
+                f"第 {i + 1} 项改动（炉次 {draft_id}）的 startMinute 必须是"
+                "非负整数，或 null 表示移除。"
+            )
+        changes.append((draft_id, start))
+
+    return body["version"], changes
+
+
+@app.get("/api/startup-plan")
+def get_startup_plan():
+    # 读取整张开炉计划：version（空计划为 1）与全部条目，按开始分钟、
+    # 炉次 ID 排序；只读，绝不读到某批改动的中间状态。
+    return store.get_startup_plan()
+
+
+@app.post(
+    "/api/startup-plan",
+    response_model=None,
+    openapi_extra={
+        "requestBody": {
+            "required": True,
+            "content": {"application/json": {"schema": _STARTUP_PLAN_SCHEMA}},
+        }
+    },
+)
+async def submit_startup_plan(request: Request):
+    # 乐观并发：携带查看时的 version 与 1～20 项改动整批提交。
+    # 先解析请求体（非法输入 422），再由存储层在单条事务内依次判定
+    # 未知炉次（404）、未归档 / 分钟越界（422）、改动后全部
+    # [start,end) 重叠（409，首尾相接允许）与版本过期（409）。
+    # 任何失败都不改计划；成功整批写入、version +1 并返回完整计划。
+    try:
+        raw = await request.body()
+        body = json.loads(raw.decode("utf-8") or "null")
+    except (json.JSONDecodeError, UnicodeDecodeError) as exc:
+        raise HTTPException(status_code=422, detail="请求体不是合法的 JSON。") from exc
+
+    version, changes = _validate_startup_plan_body(body)
+
+    try:
+        return store.submit_startup_plan(version, changes)
+    except store.StoreError as exc:
+        _raise_store_error(exc)
 
 
 @app.get("/healthz")

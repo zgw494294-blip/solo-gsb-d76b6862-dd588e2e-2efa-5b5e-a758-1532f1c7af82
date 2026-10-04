@@ -36,7 +36,7 @@ from typing import Any
 
 from . import reuse
 from .db import connect, lock, write_lock
-from .solver import Material, solve
+from .solver import STEP_MINUTES, Material, solve
 
 
 # ---------------- 异常（路由层映射为 HTTP 状态码） ----------------
@@ -1036,3 +1036,161 @@ def check_archived_reuse(draft_id: int) -> dict:
             "items": items,
             "reusable": reusable,
         }
+
+
+# ---------------- 开炉计划（单台炉，仅已归档炉次） ----------------
+
+
+def _plan_items(conn) -> list[dict]:
+    """读取计划全部条目并按（开始分钟、炉次 ID）排序。"""
+    rows = conn.execute(
+        """SELECT p.* FROM startup_plan_items p
+           ORDER BY p.start_minute, p.draft_id"""
+    ).fetchall()
+    return [
+        {
+            "draftId": r["draft_id"],
+            "startMinute": r["start_minute"],
+            "endMinute": r["start_minute"] + r["duration_min"],
+            "durationMinutes": r["duration_min"],
+        }
+        for r in rows
+    ]
+
+
+def get_startup_plan() -> dict:
+    """读取整张开炉计划：version 与全部条目（按开始分钟、炉次 ID 排序）。
+
+    空计划 version 为 1（建库时写入的 meta 行）；条目为整体提交后的
+    完整状态，读取绝不会看到半批改动。
+    """
+    with lock(), connect() as conn:
+        version = conn.execute(
+            "SELECT version FROM startup_plan_meta WHERE id=1"
+        ).fetchone()[0]
+        return {"version": version, "items": _plan_items(conn)}
+
+
+# 非负整数 Unix 分钟与时长之和仍须落在 SQLite 有符号 64 位整数范围内
+_PLAN_MAX_MINUTE = 2**63 - 1
+
+
+def submit_startup_plan(expected_version: int, changes: list[tuple[int, int | None]]) -> dict:
+    """按乐观版本整批改开炉计划（每炉次至多一段）。
+
+    单个写互斥锁 + 全局读锁 + 单条 BEGIN IMMEDIATE 事务：同版本并发提交
+    只有一批成功（后来者拿到的 version 已 +1 => 409），成功整批写入、
+    version +1 并返回完整计划；任何失败整体回滚，计划与版本都不变。
+
+    - 版本与当前不一致 => Conflict（409，附当前版本）；
+    - 任一炉次不存在 => NotFound（404）；存在但未归档 => Unprocessable（422）；
+    - 每段时长取该炉次**归档冻结曲线档数 × 5 分钟**（不读当前配方、
+      不重新求解）；开始分钟 + 时长越界 => Unprocessable（422）；
+    - null 表示从计划中移除该炉次（未排入则视为无操作，幂等）；
+    - 按改动后的**全部**条目做半开区间 [start, end) 冲突检查：重叠
+      （包括开始时间相同，即同批互换不成立的一半情形）=> Conflict（409）；
+      首尾相接（end == 另一段 start）允许；
+    - 改动中未提及的炉次原样保留。
+
+    判定先后：炉次存在（404）→ 已归档 / 分钟越界（422）→ 改动后时段
+    重叠（409）→ 版本过期（409），即批次内容本身的问题先于乐观锁失败
+    返回（与电费试算等炉次接口「先判定炉次」的口径一致）；版本过期与
+    重叠同属 409，顺序不影响调用方重试动作。
+    """
+    now = _now()
+    with write_lock(), lock(), connect() as conn:
+        with _tx(conn):
+            current_version = conn.execute(
+                "SELECT version FROM startup_plan_meta WHERE id=1"
+            ).fetchone()[0]
+
+            by_id: dict[int, dict] = {
+                r["id"]: dict(r)
+                for r in conn.execute("SELECT id FROM drafts").fetchall()
+            }
+            archived = {
+                r["draft_id"]: dict(r)
+                for r in conn.execute(
+                    "SELECT draft_id, result_json FROM archives"
+                ).fetchall()
+            }
+
+            # 404 优先于 422：先判定全部炉次是否存在，再判定是否均已归档
+            missing = [did for did, _ in changes if did not in by_id]
+            if missing:
+                raise NotFound(
+                    f"炉次草稿 {', '.join(map(str, missing))} 不存在。"
+                )
+            not_archived = [did for did, _ in changes if did not in archived]
+            if not_archived:
+                raise Unprocessable(
+                    f"炉次 {', '.join(map(str, not_archived))} 尚未归档，"
+                    "开炉计划只能安排已归档炉次。"
+                )
+
+            # 改动后的完整计划：未提及的炉次原样保留
+            existing = {
+                r["draft_id"]: {
+                    "start": r["start_minute"],
+                    "duration": r["duration_min"],
+                }
+                for r in conn.execute("SELECT * FROM startup_plan_items").fetchall()
+            }
+            merged = dict(existing)
+            for did, start in changes:
+                if start is None:
+                    merged.pop(did, None)  # null = 移除；未排入即无操作
+                    continue
+                step_count = len(json.loads(archived[did]["result_json"])["temperatures"])
+                duration = step_count * STEP_MINUTES
+                if start + duration > _PLAN_MAX_MINUTE:
+                    raise Unprocessable(
+                        f"炉次 {did} 的开始分钟 {start} 加时长 {duration} 分钟"
+                        "超过允许的最大 Unix 分钟。"
+                    )
+                merged[did] = {"start": start, "duration": duration}
+
+            # 按改动后的全部 [start, end) 判冲突：半开区间，首尾相接允许
+            ordered = sorted(merged.items(), key=lambda kv: (kv[1]["start"], kv[0]))
+            for (prev_id, prev), (next_id, cur) in zip(ordered, ordered[1:]):
+                if cur["start"] < prev["start"] + prev["duration"]:
+                    raise Conflict(
+                        f"炉次 {prev_id} 与炉次 {next_id} 的开炉时段"
+                        f"[{prev['start']}, {prev['start'] + prev['duration']}) 与 "
+                        f"[{cur['start']}, {cur['start'] + cur['duration']}) 重叠，"
+                        "首尾相接允许，重叠不允许。",
+                        current_version,
+                    )
+
+            # 批次内容全部合法后才做乐观锁判定：过期则整批不生效
+            if current_version != expected_version:
+                raise Conflict(
+                    f"开炉计划已过期：你查看的是版本 {expected_version}，"
+                    f"当前为版本 {current_version}，请重新读取后再提交。",
+                    current_version,
+                )
+
+            for did, start in changes:
+                if start is None:
+                    conn.execute(
+                        "DELETE FROM startup_plan_items WHERE draft_id=?", (did,)
+                    )
+                else:
+                    item = merged[did]
+                    conn.execute(
+                        """INSERT INTO startup_plan_items
+                           (draft_id, start_minute, duration_min, updated_at)
+                           VALUES (?,?,?,?)
+                           ON CONFLICT(draft_id) DO UPDATE SET
+                               start_minute=excluded.start_minute,
+                               duration_min=excluded.duration_min,
+                               updated_at=excluded.updated_at""",
+                        (did, item["start"], item["duration"], now),
+                    )
+            conn.execute(
+                "UPDATE startup_plan_meta SET version=version+1, updated_at=? WHERE id=1",
+                (now,),
+            )
+            new_version = current_version + 1
+
+        return {"version": new_version, "items": _plan_items(conn)}
